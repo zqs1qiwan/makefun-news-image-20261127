@@ -1,251 +1,277 @@
 #!/usr/bin/env python3
-"""Typeset the front page for news-image-20261127.
+"""Typeset the 27 November 2026 front page for make.fun news-image.
 
-A 1024x1024 newspaper front page for Friday 27 November 2026, built
-in PIL on top of six photographs cut from one fresh AI-generated 3x2
-collage (assets/entry-source.png, generated in this session, 1920x1280).
+The page is a 1024x1024 newspaper front built in PIL from six
+photographs sliced out of one fresh AI-generated 3x2 collage
+(assets/entry-source.png, 1920x1280, made for this competition day).
 
-Page order, top to bottom:
-  * masthead — title, red rule, exact date
-  * 2x2 grid of big stories (photo, kicker, headline, subhead)
-  * full-width strip with the last two big stories (thumb + text)
-  * navy ALSO band with three short items
+Everything on the page is described by small data tables near the
+top of this file — the masthead, the four feature stories, the two
+strip stories and the three short ALSO items — and a single
+slot renderer paints each story according to its kind. The script
+writes entry.png next to itself and then re-opens the file to
+confirm it is a 1024x1024 PNG under 1 MiB, printing its sha256.
 
-Running this file writes entry.png next to it and then re-opens the
-file to check it: 1024x1024, PNG, at most 1 MiB. The build is fully
-deterministic — same input bytes, same output bytes.
+The build is deterministic: same source bytes in, same PNG out.
 """
 from __future__ import annotations
 
 import hashlib
 import os
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SOURCE_PATH = os.path.join(HERE, "assets", "entry-source.png")
-OUTPUT_PATH = os.path.join(HERE, "entry.png")
+BASE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(BASE, "assets", "entry-source.png")
+OUT = os.path.join(BASE, "entry.png")
 
-W, H = 1024, 1024
-EDGE = 16
+# --- Page geometry -------------------------------------------------------
+CANVAS_W, CANVAS_H = 1024, 1024
+MARGIN = 16            # outer edge on the left and right
+COL_GAP = 20           # gap between the two feature columns
+ROW_GAP = 12           # gap between the two feature rows
+PANEL_W = 490          # width of one feature panel / strip half
+PANEL_H = 300          # height of one feature panel
+PHOTO_H = 170          # height of a feature photo
+FIRST_ROW_Y = 140      # top of the first feature row
+STRIP_TOP = 764        # top of the full-width strip
+STRIP_H = 116          # height of the strip
+THUMB_W = 150          # width of a strip thumbnail
+ALSO_TOP = 892         # top of the navy ALSO band
 
-# Palette
-PAPER = (247, 242, 231)
-INK = (18, 18, 18)
-RED = (178, 34, 34)
-GREY = (90, 88, 82)
-NAVY = (20, 36, 62)
-GOLD = (232, 190, 90)
-PALE = (245, 245, 245)
-FRAME = (40, 40, 40)
+# --- Palette --------------------------------------------------------------
+PALETTE = {
+    "paper": (247, 242, 231),
+    "ink": (18, 18, 18),
+    "red": (178, 34, 34),
+    "grey": (90, 88, 82),
+    "navy": (20, 36, 62),
+    "gold": (232, 190, 90),
+    "pale": (245, 245, 245),
+    "frame": (40, 40, 40),
+}
 
+# --- Typefaces ------------------------------------------------------------
 FONT_DIR = "/usr/share/fonts/truetype/noto"
-FONT_FILES = {
-    "cond": os.path.join(FONT_DIR, "NotoSans-Condensed.ttf"),
-    "cond_bold": os.path.join(FONT_DIR, "NotoSans-CondensedBold.ttf"),
+_FONT_FILES = {
+    False: os.path.join(FONT_DIR, "NotoSans-Condensed.ttf"),
+    True: os.path.join(FONT_DIR, "NotoSans-CondensedBold.ttf"),
+}
+_FONT_CACHE: dict[tuple[bool, int], ImageFont.FreeTypeFont] = {}
+
+
+def typeface(bold: bool, size: int) -> ImageFont.FreeTypeFont:
+    """Return (and cache) a Noto Sans Condensed face at the given size."""
+    key = (bold, size)
+    if key not in _FONT_CACHE:
+        _FONT_CACHE[key] = ImageFont.truetype(_FONT_FILES[bold], size)
+    return _FONT_CACHE[key]
+
+
+# --- Source photographs ---------------------------------------------------
+# Cell boxes were measured off this day's collage: a grey frame of about
+# 23px, vertical gutters at x=633-652 and x=1267-1286, and a horizontal
+# gutter at y=638-658. Each box is inset a few pixels past the gutters.
+# The focus point keeps the interesting part of each photo in frame
+# when it is cropped to its slot shape.
+PHOTOS = {
+    "storm":  {"box": (26, 24, 629, 634),   "focus": (0.50, 0.55)},
+    "kuwait": {"box": (656, 24, 1263, 634), "focus": (0.50, 0.55)},
+    "port":   {"box": (1290, 24, 1894, 634), "focus": (0.50, 0.50)},
+    "summit": {"box": (26, 662, 629, 1256), "focus": (0.50, 0.50)},
+    "bank":   {"box": (656, 662, 1263, 1256), "focus": (0.50, 0.45)},
+    "gaza":   {"box": (1290, 662, 1894, 1256), "focus": (0.50, 0.55)},
 }
 
+# --- Stories --------------------------------------------------------------
+TITLE = "THE WORLD IN ONE DAY"
+DATE_LINE = "FRIDAY, 27 NOVEMBER 2026"
 
-def font(kind: str, size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(FONT_FILES[kind], size)
-
-
-def split_lines(draw: ImageDraw.ImageDraw, text: str,
-                fnt: ImageFont.FreeTypeFont, max_w: int) -> list[str]:
-    """Greedy word wrap: every returned line fits inside max_w pixels."""
-    lines: list[str] = []
-    line = ""
-    for word in text.split():
-        trial = f"{line} {word}".strip()
-        if draw.textlength(trial, font=fnt) <= max_w:
-            line = trial
-        else:
-            if line:
-                lines.append(line)
-            line = word
-    if line:
-        lines.append(line)
-    return lines
-
-
-def headline_font(draw: ImageDraw.ImageDraw, text: str, start: int,
-                  max_w: int, max_lines: int = 2):
-    """Largest bold-condensed font (<= start) wrapping into max_lines."""
-    size = start
-    while size > 13:
-        fnt = font("cond_bold", size)
-        if len(split_lines(draw, text, fnt, max_w)) <= max_lines:
-            return fnt, split_lines(draw, text, fnt, max_w)
-        size -= 1
-    fnt = font("cond_bold", 13)
-    return fnt, split_lines(draw, text, fnt, max_w)
-
-
-def crop_cover(img: Image.Image, focus: tuple[float, float],
-               tw: int, th: int) -> Image.Image:
-    """Resize-crop img to exactly tw x th, keeping the focus point in frame."""
-    w, h = img.size
-    scale = max(tw / w, th / h)
-    cw, ch = round(tw / scale), round(th / scale)
-    cx, cy = round(focus[0] * w), round(focus[1] * h)
-    x0 = min(max(cx - cw // 2, 0), w - cw)
-    y0 = min(max(cy - ch // 2, 0), h - ch)
-    return img.crop((x0, y0, x0 + cw, y0 + ch)).resize((tw, th), Image.LANCZOS)
-
-
-# Cell rectangles measured from this session's collage (1920x1280):
-# grey frame ~23px, vertical gutters x=633-652 and x=1267-1286,
-# horizontal gutter y=638-658. Each cell is inset a few px past them.
-CELLS = {
-    "storm": (26, 24, 629, 634),
-    "kuwait": (656, 24, 1263, 634),
-    "port": (1290, 24, 1894, 634),
-    "summit": (26, 662, 629, 1256),
-    "bank": (656, 662, 1263, 1256),
-    "gaza": (1290, 662, 1894, 1256),
-}
-FOCUS = {
-    "storm": (0.50, 0.55),
-    "kuwait": (0.50, 0.55),
-    "port": (0.50, 0.50),
-    "summit": (0.50, 0.50),
-    "bank": (0.50, 0.45),
-    "gaza": (0.50, 0.55),
-}
-
-PANEL_STORIES = [
-    {"cell": "storm", "kicker": "UNITED STATES",
-     "head": "STORM SURGE TOPS SANDY",
-     "sub": "Thanksgiving nor'easter floods the East Coast"},
-    {"cell": "kuwait", "kicker": "KUWAIT",
-     "head": "DRONE KILLS TWO IN KUWAIT",
-     "sub": "Italy blames Iran; Tehran denies any role"},
-    {"cell": "port", "kicker": "TRADE",
-     "head": "US UNVEILS TARIFFS ON 14 NATIONS",
-     "sub": "China capped at 20%; hearing set for January"},
-    {"cell": "summit", "kicker": "EUROPE",
-     "head": "EU SPLIT OVER UKRAINE LOAN",
-     "sub": "Leaders divided on a $49bn loan to Kyiv"},
+# (photo key, kicker, headline, subhead) — the four big panels.
+FEATURES = [
+    ("storm", "UNITED STATES", "STORM SURGE TOPS SANDY",
+     "Thanksgiving nor'easter floods the East Coast"),
+    ("kuwait", "KUWAIT", "DRONE KILLS TWO IN KUWAIT",
+     "Italy blames Iran; Tehran denies any role"),
+    ("port", "TRADE", "US UNVEILS TARIFFS ON 14 NATIONS",
+     "China capped at 20%; hearing set for January"),
+    ("summit", "EUROPE", "EU SPLIT OVER UKRAINE LOAN",
+     "Leaders divided on a $49bn loan to Kyiv"),
 ]
-STRIP_STORIES = [
-    {"cell": "bank", "kicker": "EUROPE",
-     "head": "SPAIN'S DE COS TO LEAD ECB",
-     "sub": "Chosen to succeed Lagarde at the central bank"},
-    {"cell": "gaza", "kicker": "GAZA",
-     "head": "ISRAELI STRIKES KILL 10 IN GAZA",
-     "sub": "Ceasefire under strain for a third night"},
+
+# (photo key, kicker, headline, subhead) — the two strip stories.
+STRIPS = [
+    ("bank", "EUROPE", "SPAIN'S DE COS TO LEAD ECB",
+     "Chosen to succeed Lagarde at the central bank"),
+    ("gaza", "GAZA", "ISRAELI STRIKES KILL 10 IN GAZA",
+     "Ceasefire under strain for a third night"),
 ]
-ALSO_ITEMS = [
+
+ALSO = [
     "EBOLA IN CONGO PASSES 12,000 CASES \u2014 second-largest outbreak on record",
     "NETANYAHU JUDGES URGE DROPPING BRIBERY CHARGE",
     "GUINEA-BISSAU JUNTA DELAYS ELECTION TO 2028",
 ]
 
-DATE_LINE = "FRIDAY, 27 NOVEMBER 2026"
+
+# --- Text helpers ---------------------------------------------------------
+def wrap_lines(draw, text, fnt, limit):
+    """Yield the lines of `text` word-wrapped to fit `limit` pixels.
+
+    Words accumulate onto the current line until the next word would
+    overflow it; the line is then emitted and a fresh one started.
+    """
+    words = text.split()
+    current: list[str] = []
+    width = 0.0
+    space_w = draw.textlength(" ", font=fnt)
+    for word in words:
+        word_w = draw.textlength(word, font=fnt)
+        extra = word_w if not current else space_w + word_w
+        if current and width + extra > limit:
+            yield " ".join(current)
+            current = [word]
+            width = word_w
+        else:
+            current.append(word)
+            width += extra
+    if current:
+        yield " ".join(current)
 
 
-def draw_masthead(draw: ImageDraw.ImageDraw) -> None:
-    draw.text((W // 2, 12), "THE WORLD IN ONE DAY",
-              font=font("cond_bold", 62), fill=INK, anchor="ma")
-    draw.rectangle((EDGE, 96, W - EDGE, 99), fill=RED)
-    draw.text((W // 2, 104), DATE_LINE,
-              font=font("cond_bold", 27), fill=INK, anchor="ma")
+def fit_headline(draw, text, ceiling, limit, max_lines=2):
+    """Biggest bold face (at most `ceiling`) wrapping into `max_lines`."""
+    for size in range(ceiling, 12, -1):
+        fnt = typeface(True, size)
+        wrapped = list(wrap_lines(draw, text, fnt, limit))
+        if len(wrapped) <= max_lines:
+            return fnt, wrapped
+    fnt = typeface(True, 13)
+    return fnt, list(wrap_lines(draw, text, fnt, limit))
 
 
-def draw_panels(page: Image.Image, draw: ImageDraw.ImageDraw,
-                src: Image.Image) -> None:
-    panel_w, panel_h, photo_h = 490, 300, 170
-    xs = [EDGE, 526]
-    ys = [140, 452]
-    for i, story in enumerate(PANEL_STORIES):
-        x, y = xs[i % 2], ys[i // 2]
-        x0, y0, x1, y1 = CELLS[story["cell"]]
-        photo = crop_cover(src.crop((x0, y0, x1, y1)),
-                           FOCUS[story["cell"]], panel_w, photo_h)
-        page.paste(photo, (x, y))
-        draw.rectangle((x, y, x + panel_w - 1, y + photo_h - 1),
-                       outline=FRAME, width=1)
-        ty = y + photo_h + 8
-        draw.text((x, ty), story["kicker"], font=font("cond_bold", 19),
-                  fill=RED)
-        ty += 24
-        head_fnt, head_lines = headline_font(draw, story["head"], 36, panel_w)
-        for line in head_lines:
-            draw.text((x, ty), line, font=head_fnt, fill=INK)
-            ty += head_fnt.size + 2
-        # Subheads sit on a fixed baseline per row (two headline lines
-        # reserved) so the two panels of a row line up even when one
-        # headline wraps and the other does not.
-        sub_y = y + photo_h + 8 + 24 + 2 * (head_fnt.size + 2)
-        draw.text((x, sub_y), story["sub"], font=font("cond", 23), fill=GREY)
+def fit_single_line(draw, text, ceiling, floor, limit):
+    """Largest regular face (between `floor` and `ceiling`) fitting one line."""
+    size = ceiling
+    while size > floor:
+        fnt = typeface(False, size)
+        if draw.textlength(text, font=fnt) <= limit:
+            return fnt
+        size -= 1
+    return typeface(False, floor)
 
 
-def draw_strip(page: Image.Image, draw: ImageDraw.ImageDraw,
-               src: Image.Image) -> None:
-    top, height, thumb_w = 764, 116, 150
-    for i, story in enumerate(STRIP_STORIES):
-        x = EDGE if i == 0 else 526
-        x0, y0, x1, y1 = CELLS[story["cell"]]
-        thumb = crop_cover(src.crop((x0, y0, x1, y1)),
-                           FOCUS[story["cell"]], thumb_w, height)
-        page.paste(thumb, (x, top))
-        draw.rectangle((x, top, x + thumb_w - 1, top + height - 1),
-                       outline=FRAME, width=1)
-        tx = x + thumb_w + 12
-        text_w = 490 - thumb_w - 12
-        draw.text((tx, top + 2), story["kicker"], font=font("cond_bold", 18),
-                  fill=RED)
-        head_fnt, head_lines = headline_font(draw, story["head"], 30, text_w)
-        ty = top + 24
-        for line in head_lines:
-            draw.text((tx, ty), line, font=head_fnt, fill=INK)
-            ty += head_fnt.size + 1
-        sub_fnt = font("cond", 18)
-        for line in split_lines(draw, story["sub"], sub_fnt, text_w)[:2]:
-            draw.text((tx, ty + 2), line, font=sub_fnt, fill=GREY)
-            ty += sub_fnt.size + 1
+def cover(source, photo_key, size):
+    """Crop one collage cell to `size`, keeping its focus point in frame."""
+    spec = PHOTOS[photo_key]
+    tile = source.crop(spec["box"])
+    return ImageOps.fit(tile, size, method=Image.LANCZOS,
+                        centering=spec["focus"])
 
 
-def draw_also(draw: ImageDraw.ImageDraw) -> None:
-    top = 892
-    draw.rectangle((0, top, W, H), fill=NAVY)
-    draw.text((EDGE, top + 6), "ALSO TODAY", font=font("cond_bold", 22),
-              fill=GOLD)
-    # Items at 29px for more presence; the shrink loop drops any item
-    # that would run past the right edge back to a size that fits.
-    y = top + 33
-    for item in ALSO_ITEMS:
-        size = 29
-        while size > 19:
-            fnt = font("cond", size)
-            if draw.textlength(item, font=fnt) <= W - 34 - EDGE:
-                break
-            size -= 1
-        draw.rectangle((EDGE, y + 9, EDGE + 8, y + 17), fill=RED)
-        draw.text((34, y), item, font=fnt, fill=PALE)
+# --- Page sections --------------------------------------------------------
+def paint_header(draw):
+    """Masthead: title, red rule, exact date."""
+    draw.text((CANVAS_W // 2, 12), TITLE, font=typeface(True, 62),
+              fill=PALETTE["ink"], anchor="ma")
+    draw.rectangle([MARGIN, 96, CANVAS_W - MARGIN, 99], fill=PALETTE["red"])
+    draw.text((CANVAS_W // 2, 104), DATE_LINE, font=typeface(True, 27),
+              fill=PALETTE["ink"], anchor="ma")
+
+
+def paint_feature(page, draw, source, cell, kicker, head, sub, x, y):
+    """One 2x2-grid panel: photo on top, kicker, headline, subhead."""
+    photo = cover(source, cell, (PANEL_W, PHOTO_H))
+    page.paste(photo, (x, y))
+    draw.rectangle([x, y, x + PANEL_W - 1, y + PHOTO_H - 1],
+                   outline=PALETTE["frame"], width=1)
+    text_top = y + PHOTO_H + 8
+    draw.text((x, text_top), kicker, font=typeface(True, 19),
+              fill=PALETTE["red"])
+    head_fnt, head_lines = fit_headline(draw, head, 36, PANEL_W)
+    line_y = text_top + 24
+    for line in head_lines:
+        draw.text((x, line_y), line, font=head_fnt, fill=PALETTE["ink"])
+        line_y += head_fnt.size + 2
+    # The subhead sits on a fixed baseline two headline lines below the
+    # kicker, so the two panels of a row line up even when one headline
+    # wraps and the other does not.
+    sub_y = text_top + 24 + 2 * (head_fnt.size + 2)
+    draw.text((x, sub_y), sub, font=typeface(False, 23),
+              fill=PALETTE["grey"])
+
+
+def paint_strip(page, draw, source, cell, kicker, head, sub, x, y):
+    """One half of the full-width strip: thumbnail left, text right."""
+    thumb = cover(source, cell, (THUMB_W, STRIP_H))
+    page.paste(thumb, (x, y))
+    draw.rectangle([x, y, x + THUMB_W - 1, y + STRIP_H - 1],
+                   outline=PALETTE["frame"], width=1)
+    tx = x + THUMB_W + 12
+    text_w = PANEL_W - THUMB_W - 12
+    draw.text((tx, y + 2), kicker, font=typeface(True, 18),
+              fill=PALETTE["red"])
+    head_fnt, head_lines = fit_headline(draw, head, 30, text_w)
+    line_y = y + 24
+    for line in head_lines:
+        draw.text((tx, line_y), line, font=head_fnt, fill=PALETTE["ink"])
+        line_y += head_fnt.size + 1
+    sub_fnt = typeface(False, 18)
+    for line in list(wrap_lines(draw, sub, sub_fnt, text_w))[:2]:
+        draw.text((tx, line_y + 2), line, font=sub_fnt, fill=PALETTE["grey"])
+        line_y += sub_fnt.size + 1
+
+
+def paint_also(draw):
+    """Navy footer band with three short items at 29px."""
+    draw.rectangle([0, ALSO_TOP, CANVAS_W, CANVAS_H], fill=PALETTE["navy"])
+    draw.text((MARGIN, ALSO_TOP + 6), "ALSO TODAY", font=typeface(True, 22),
+              fill=PALETTE["gold"])
+    y = ALSO_TOP + 33
+    for item in ALSO:
+        # Shrink any item that would run past the right edge.
+        fnt = fit_single_line(draw, item, 29, 19, CANVAS_W - 34 - MARGIN)
+        draw.rectangle([MARGIN, y + 9, MARGIN + 8, y + 17],
+                       fill=PALETTE["red"])
+        draw.text((34, y), item, font=fnt, fill=PALETTE["pale"])
         y += 31
 
 
-def build() -> None:
-    src = Image.open(SOURCE_PATH).convert("RGB")
-    page = Image.new("RGB", (W, H), PAPER)
+# --- Build ----------------------------------------------------------------
+def assemble():
+    """Lay out the whole front page and return it as a PIL image."""
+    source = Image.open(SRC).convert("RGB")
+    page = Image.new("RGB", (CANVAS_W, CANVAS_H), PALETTE["paper"])
     draw = ImageDraw.Draw(page)
-    draw_masthead(draw)
-    draw_panels(page, draw, src)
-    draw_strip(page, draw, src)
-    draw_also(draw)
-    page.save(OUTPUT_PATH, "PNG", optimize=True)
-    print("wrote", OUTPUT_PATH)
+    paint_header(draw)
+    for row in range(2):
+        for col in range(2):
+            cell, kicker, head, sub = FEATURES[row * 2 + col]
+            x = MARGIN + col * (PANEL_W + COL_GAP)
+            y = FIRST_ROW_Y + row * (PANEL_H + ROW_GAP)
+            paint_feature(page, draw, source, cell, kicker, head, sub, x, y)
+    for i, (cell, kicker, head, sub) in enumerate(STRIPS):
+        x = MARGIN + i * (PANEL_W + COL_GAP)
+        paint_strip(page, draw, source, cell, kicker, head, sub, x, STRIP_TOP)
+    paint_also(draw)
+    return page
 
 
-def verify() -> str:
-    with Image.open(OUTPUT_PATH) as im:
-        assert im.size == (W, H), im.size
+def build():
+    page = assemble()
+    page.save(OUT, "PNG", optimize=True)
+    print("wrote", OUT)
+
+
+def verify():
+    """Re-open entry.png and check size, format, byte budget and hash."""
+    with Image.open(OUT) as im:
+        assert im.size == (CANVAS_W, CANVAS_H), im.size
         assert im.format == "PNG"
-    size = os.path.getsize(OUTPUT_PATH)
-    assert size <= 1_048_576, size
-    digest = hashlib.sha256(open(OUTPUT_PATH, "rb").read()).hexdigest()
-    print(f"verify: 1024x1024 PNG, {size} bytes, sha256 {digest}")
+    nbytes = os.path.getsize(OUT)
+    assert nbytes <= 1_048_576, nbytes
+    digest = hashlib.sha256(open(OUT, "rb").read()).hexdigest()
+    print(f"verify: {CANVAS_W}x{CANVAS_H} PNG, {nbytes} bytes, sha256 {digest}")
     return digest
 
 
